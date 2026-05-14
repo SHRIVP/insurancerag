@@ -1,0 +1,23 @@
+# Downloaded source PDFs (large files — run download_data.py to fetch)
+data/
+
+# ChromaDB vector store (generated — run ingest.py to rebuild)
+chroma_db/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+*.env
+
+# macOS
+.DS_Store

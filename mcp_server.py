@@ -19,10 +19,13 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP(
     name="Insurance Underwriting RAG",
     instructions=(
-        "Use query_underwriting_guidelines to answer any question about P&C insurance "
-        "underwriting — Commercial Property, Commercial General Liability (CGL), or "
-        "Personal Auto. Always call this tool before answering underwriting questions "
-        "so your answer is grounded in the actual guideline documents."
+        "Use ask_underwriting to answer any question about P&C insurance underwriting "
+        "— Commercial Property, Commercial General Liability (CGL), Personal Auto — or "
+        "NAICS industry classification. It routes each question (via the Jev model) to "
+        "either the OKF knowledge bundle or vector RAG. Use "
+        "query_underwriting_guidelines to force vector RAG with an explicit LOB filter. "
+        "Always call one of these tools before answering so your answer is grounded "
+        "in the actual guideline documents."
     ),
 )
 
@@ -50,6 +53,28 @@ def query_underwriting_guidelines(question: str, lob: str = "") -> str:
     lob_filter = lob.strip() or None
     result = query(question, lob_filter=lob_filter)
     return format_response(result)
+
+
+@mcp.tool()
+def ask_underwriting(question: str) -> str:
+    """
+    Answer a P&C underwriting or NAICS classification question, letting the Jev
+    router choose the retrieval path:
+      - OKF: structured lookup in the Open Knowledge Format bundle (NAICS codes,
+        specific named entities, link-navigable pages)
+      - RAG: semantic vector search for open-ended / cross-document questions
+    The router also picks a line-of-business filter when it is confident.
+
+    Returns the routing decision, a grounded answer, and source citations.
+
+    Args:
+        question: Natural-language underwriting or classification question.
+    """
+    from router import answer, format_decision
+    from rag_query import format_response
+
+    decision, result = answer(question)
+    return f"{format_decision(decision)}\n\n{format_response(result)}"
 
 
 if __name__ == "__main__":

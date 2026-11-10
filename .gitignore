@@ -4,6 +4,9 @@ data/
 # ChromaDB vector store (generated — run ingest.py to rebuild)
 chroma_db/
 
+# OKF knowledge bundle (generated — run okf_build.py to rebuild)
+okf/
+
 # Python
 __pycache__/
 *.py[cod]

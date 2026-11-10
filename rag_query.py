@@ -10,33 +10,14 @@ Usage (module):
     print(format_response(result))
 """
 
-import os
 import sys
 from dataclasses import dataclass, field
 
-import cohere
-import chromadb
+import providers
+from providers import SYSTEM_PROMPT, generate_answer  # noqa: F401  (re-exported)
 
-COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
 CHROMA_DIR = "chroma_db"
-COLLECTION_NAME = "underwriting_guidelines"
-EMBED_MODEL = "embed-english-v3.0"
-GENERATE_MODEL = "command-r-plus-08-2024"
 TOP_K = 5
-
-SYSTEM_PROMPT = """\
-You are a senior P&C insurance underwriting assistant with deep expertise across \
-Commercial Property, Commercial General Liability (CGL), and Personal Auto lines of business.
-
-When answering:
-- Ground every statement in the provided reference documents.
-- Be precise: cite specific policy provisions, eligibility thresholds, exclusions, or \
-  limit structures when relevant.
-- Use professional underwriting terminology (occurrence vs. claims-made, TIV, BI/PD, \
-  named-storm deductible, MVR, etc.).
-- If the documents do not fully address the question, clearly state what is missing \
-  rather than speculating.
-- Keep your answer well-structured: a direct answer first, then supporting detail."""
 
 
 @dataclass
@@ -52,7 +33,7 @@ class RAGResult:
     question: str
     answer: str
     citations: list[Citation] = field(default_factory=list)
-    grounded_spans: list[dict] = field(default_factory=list)  # raw Cohere citations
+    grounded_spans: list[dict] = field(default_factory=list)  # citation spans
 
 
 def query(
@@ -61,8 +42,9 @@ def query(
     top_k: int = TOP_K,
 ) -> RAGResult:
     """
-    Retrieve top_k chunks from ChromaDB, then generate a grounded answer
-    via Cohere Command R+ with inline citations.
+    Retrieve top_k chunks from ChromaDB, then generate a grounded answer with
+    inline citations. Embedding/generation backends come from `providers`
+    (local Ollama Qwen by default, Cohere optional).
 
     Args:
         question:   Natural-language underwriting question.
@@ -73,20 +55,20 @@ def query(
     Returns:
         RAGResult with the generated answer and source citations.
     """
-    if not COHERE_API_KEY:
-        raise EnvironmentError("COHERE_API_KEY environment variable not set.")
+    import chromadb  # imported lazily so the OKF path doesn't need it
 
-    co = cohere.Client(api_key=COHERE_API_KEY)
     chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
-    collection = chroma_client.get_collection(COLLECTION_NAME)
+    name = providers.collection_name()
+    try:
+        collection = chroma_client.get_collection(name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Chroma collection {name!r} not found — run `python ingest.py` with "
+            f"EMBED_PROVIDER={providers.EMBED_PROVIDER} first."
+        ) from exc
 
     # ── 1. Embed query ────────────────────────────────────────────────────────
-    embed_resp = co.embed(
-        texts=[question],
-        model=EMBED_MODEL,
-        input_type="search_query",
-    )
-    query_vec = embed_resp.embeddings[0]
+    query_vec = providers.embed([question], input_type="search_query")[0]
 
     # ── 2. Retrieve from Chroma ───────────────────────────────────────────────
     where = {"lob": {"$eq": lob_filter}} if lob_filter else None
@@ -103,23 +85,17 @@ def query(
     metas: list[dict] = results["metadatas"][0]
     distances: list[float] = results["distances"][0]
 
-    # ── 3. Build Cohere documents payload (grounded generation) ───────────────
-    cohere_docs = [
-        {
-            "id": str(i),
-            "title": f"{m['source']}  |  Page {m['page']}  |  {m['lob']}",
-            "snippet": chunk,
-        }
-        for i, (chunk, m) in enumerate(zip(chunks, metas))
-    ]
-
-    # ── 4. Generate answer with Command R+ ───────────────────────────────────
-    chat_resp = co.chat(
-        model=GENERATE_MODEL,
-        message=question,
-        preamble=SYSTEM_PROMPT,
-        documents=cohere_docs,
-        temperature=0.1,
+    # ── 3–4. Grounded generation ─────────────────────────────────────────────
+    answer, grounded = generate_answer(
+        question,
+        [
+            {
+                "id": str(i),
+                "title": f"{m['source']}  |  Page {m['page']}  |  {m['lob']}",
+                "snippet": chunk,
+            }
+            for i, (chunk, m) in enumerate(zip(chunks, metas))
+        ],
     )
 
     # ── 5. Build result ───────────────────────────────────────────────────────
@@ -133,21 +109,9 @@ def query(
         for m, d in zip(metas, distances)
     ]
 
-    grounded = []
-    if chat_resp.citations:
-        for c in chat_resp.citations:
-            grounded.append(
-                {
-                    "text": c.text,
-                    "document_ids": c.document_ids,
-                    "start": c.start,
-                    "end": c.end,
-                }
-            )
-
     return RAGResult(
         question=question,
-        answer=chat_resp.text,
+        answer=answer,
         citations=source_citations,
         grounded_spans=grounded,
     )

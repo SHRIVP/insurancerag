@@ -4,11 +4,14 @@ Ingest P&C insurance guideline PDFs into ChromaDB.
 Pipeline:
   1. Load each PDF from ./data/ with PyMuPDF
   2. Chunk by paragraph, targeting ~300 tokens per chunk
-  3. Embed chunks with Cohere embed-english-v3.0 (search_document)
-  4. Store in local ChromaDB with metadata: source, page, lob
+  3. Embed chunks (search_document) with the configured provider —
+     local Ollama qwen3-embedding by default, or Cohere embed-english-v3.0
+  4. Store in local ChromaDB with metadata: source, page, lob.
+     Each embedding provider has its own collection (providers.collection_name()).
 
 Usage:
-    python ingest.py
+    python ingest.py                         # Ollama / Qwen3-Embedding (default)
+    EMBED_PROVIDER=cohere python ingest.py   # Cohere
 """
 
 import os
@@ -17,17 +20,16 @@ import sys
 import time
 from pathlib import Path
 
-import cohere
 import chromadb
 import fitz  # PyMuPDF
 
-COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
+import providers
+
 DATA_DIR = Path("data")
 CHROMA_DIR = "chroma_db"
-COLLECTION_NAME = "underwriting_guidelines"
-EMBED_MODEL = "embed-english-v3.0"
+COLLECTION_NAME = providers.collection_name()
 TARGET_TOKENS = 300
-EMBED_BATCH = 90  # Cohere max is 96; stay below for safety
+EMBED_BATCH = 90 if providers.EMBED_PROVIDER == "cohere" else 32  # Cohere max is 96
 
 # Filename-prefix → LOB label
 LOB_MAP = {
@@ -95,7 +97,6 @@ def _detect_lob(filename: str) -> str:
 
 def ingest_pdf(
     pdf_path: Path,
-    co: cohere.Client,
     collection: chromadb.Collection,
 ) -> int:
     lob = _detect_lob(pdf_path.name)
@@ -133,31 +134,19 @@ def ingest_pdf(
     # = ~27k tokens. Sleep 20s between batches to stay well under the limit.
     for i in range(0, len(all_texts), EMBED_BATCH):
         batch_texts = all_texts[i : i + EMBED_BATCH]
-        for attempt in range(5):
-            try:
-                resp = co.embed(
-                    texts=batch_texts,
-                    model=EMBED_MODEL,
-                    input_type="search_document",
-                )
-                break
-            except cohere.errors.too_many_requests_error.TooManyRequestsError:
-                wait = 60 * (attempt + 1)
-                print(f"  rate-limited — waiting {wait}s …")
-                time.sleep(wait)
-        else:
-            sys.exit("ERROR: embed rate limit retries exhausted.")
+        embeddings = providers.embed(batch_texts, input_type="search_document")
 
         collection.add(
             documents=batch_texts,
-            embeddings=resp.embeddings,
+            embeddings=embeddings,
             metadatas=all_meta[i : i + EMBED_BATCH],
             ids=all_ids[i : i + EMBED_BATCH],
         )
 
-        # Pace subsequent batches to avoid hitting 100k tokens/min limit
-        if i + EMBED_BATCH < len(all_texts):
+        # Cohere trial keys: pace batches to stay under 100k tokens/min
+        if providers.EMBED_PROVIDER == "cohere" and i + EMBED_BATCH < len(all_texts):
             time.sleep(20)
+        print(f"  {min(i + EMBED_BATCH, len(all_texts))}/{len(all_texts)} chunks", end="\r")
 
     return len(all_texts)
 
@@ -171,14 +160,14 @@ def _already_ingested(collection: chromadb.Collection, filename: str) -> bool:
 
 
 def main() -> None:
-    if not COHERE_API_KEY:
+    if providers.EMBED_PROVIDER == "cohere" and not providers.COHERE_API_KEY:
         sys.exit("ERROR: COHERE_API_KEY environment variable not set.")
 
     pdfs = sorted(DATA_DIR.glob("*.pdf"))
     if not pdfs:
         sys.exit(f"ERROR: No PDFs found in ./{DATA_DIR}. Run download_data.py first.")
 
-    co = cohere.Client(api_key=COHERE_API_KEY)
+    print(f"Embedding provider: {providers.EMBED_PROVIDER}  →  collection {COLLECTION_NAME!r}")
     client = chromadb.PersistentClient(path=CHROMA_DIR)
 
     # Open existing collection or create it fresh
@@ -193,7 +182,7 @@ def main() -> None:
             print(f"[skip] {pdf.name}  (already in collection)")
             continue
         print(f"\nIngesting: {pdf.name}  (LOB: {_detect_lob(pdf.name)})")
-        n = ingest_pdf(pdf, co, collection)
+        n = ingest_pdf(pdf, collection)
         print(f"  {n} chunks stored")
         total_chunks += n
 
